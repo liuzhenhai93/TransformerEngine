@@ -41,6 +41,7 @@ import transformer_engine.pytorch.attention.dot_product_attention.utils as dpa_u
 from transformer_engine.pytorch.attention.dot_product_attention.utils import (
     FlashAttentionUtils as fa_utils,
 )
+import torch.nn.functional as F
 
 _cu_seqlens_info_with_cp_cache = {}
 
@@ -664,7 +665,15 @@ class AttnFuncWithCPAndKVP2P(torch.autograd.Function):
         fwd_results_correction_done = torch.cuda.Event()
 
         p2p_comm_buffers = [None for _ in range(cp_size)]
-        if qkv_format in ["bshd", "sbhd"]:
+        
+        head_dim_qk = k.shape[-1]
+        head_dim_v = v.shape[-1]
+        enable_mla = False
+        if head_dim_qk != head_dim_v:
+            v = F.pad(v, (0, head_dim_qk - head_dim_v))
+            enable_mla = True
+            
+        if use_fused_attention and qkv_format in ["bshd", "sbhd"]:
             p2p_comm_buffers[0] = torch.cat((k.unsqueeze(-3), v.unsqueeze(-3)), dim=-3)
         else:
             p2p_comm_buffers[0] = torch.cat((k.unsqueeze(0), v.unsqueeze(0)), dim=0)
@@ -1352,6 +1361,8 @@ class AttnFuncWithCPAndKVP2P(torch.autograd.Function):
             O_CP_quantizer.amax.copy_(amax_cp_fwd[1])
 
         out_fp8 = None
+        if enable_mla:
+            out = out[..., 0:head_dim_v].contiguous()
         out_f16 = out.to(qkv_dtype)
 
         if fp8 and (is_output_fp8 or int(os.getenv("NVTE_FP8_DPA_BWD", "1"))):
@@ -1381,6 +1392,9 @@ class AttnFuncWithCPAndKVP2P(torch.autograd.Function):
         )
         ctx.save_for_backward(*tensors_to_save)
         ctx.tensor_objects = tensor_objects
+        ctx.enable_mla = enable_mla
+        ctx.head_dim_qk = head_dim_qk
+        ctx.head_dim_v = head_dim_v
 
         ctx.cp_group_a2a = cp_group_a2a
         ctx.cp_size_a2a = cp_size_a2a
@@ -1441,6 +1455,9 @@ class AttnFuncWithCPAndKVP2P(torch.autograd.Function):
         q, kv, out, softmax_lse, cu_seqlens_q_padded, cu_seqlens_kv_padded, *other_tensors = (
             restore_from_saved(ctx.tensor_objects, ctx.saved_tensors)
         )
+        if ctx.enable_mla:
+            out = F.pad(out, (0, ctx.head_dim_qk - ctx.head_dim_v))
+            dout = F.pad(dout, (0, ctx.head_dim_qk - ctx.head_dim_v))
         cu_seqlens_q_per_step = other_tensors[:cp_size]
         cu_seqlens_kv_per_step = other_tensors[cp_size : cp_size * 2]
         rng_states = other_tensors[cp_size * 2 : cp_size * 3]
@@ -2339,6 +2356,9 @@ class AttnFuncWithCPAndKVP2P(torch.autograd.Function):
             dv = ctx.dQKV_quantizer.create_tensor_from_data(dv, fake_dtype=dout_dtype)
         nvtx_range_pop("transformer_engine.AttnFuncWithCPAndKVP2P.backward")
 
+        if ctx.enable_mla:
+            dv = dv[..., 0 : ctx.head_dim_v].contiguous()
+            
         return (
             None,
             dq,
